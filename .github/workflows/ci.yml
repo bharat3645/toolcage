@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + integration tests
+        run: cargo test --all-targets
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Harness self-check (driver + audit checker vs the Python mock)
+        run: |
+          WORK=$(mktemp -d)
+          bash ci/make_workdir.sh "$WORK"
+          python3 ci/smoke_driver.py "$WORK" python3 ci/mock_toolcage.py dummy.wasm
+          python3 ci/audit_check.py "$WORK"
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fixtures/toy-server
+      - name: End-to-end smoke (real binary + real wasm guest)
+        run: bash ci/smoke.sh
