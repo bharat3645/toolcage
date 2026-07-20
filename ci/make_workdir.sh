@@ -24,6 +24,7 @@ defaults:
 unlisted_tools: deny
 tools:
   echo: {}
+  counter: {}
   env:
     env:
       CAGE_GREETING: "granted-hello"
