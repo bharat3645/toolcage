@@ -8,6 +8,11 @@ WORK="$1"
 mkdir -p "$WORK/data" "$WORK/out"
 echo "hello from the cage" > "$WORK/data/hello.txt"
 echo "TOP-SECRET-HOST-FILE u9f3k" > "$WORK/secret.txt"
+# Symlink escape fixture: a link that LIVES inside the ro mount but POINTS
+# outside it, at the same host secret above. Different escape vector than a
+# literal ".." in the request path - the mount-boundary check has to survive
+# symlink resolution, not just string-prefix matching on the raw guest path.
+ln -sf "$WORK/secret.txt" "$WORK/data/escape-link"
 
 cat > "$WORK/policy-a.yaml" <<EOF
 version: 1

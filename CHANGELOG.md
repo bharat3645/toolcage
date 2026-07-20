@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+Production-polish sprint: closes two real adversarial-test gaps in the
+containment claims, plus the first real per-call overhead numbers.
+
+- New adversarial e2e tests against the real hostile guest, not just
+  design-level assertions: (1) a `counter` tool in `fixtures/toy-server`
+  that increments a process-global and returns it — every call must see a
+  fresh zero if instances are truly isolated, tested 3x in a row; (2) a
+  symlink planted inside the read-only mount pointing at the host secret
+  file just outside it (`ci/make_workdir.sh`'s `escape-link`) — a
+  different escape vector than the `..`-in-path case already covered,
+  since the raw guest path string never leaves the mount, only symlink
+  resolution does. Both wired through `ci/smoke_driver.py`'s scenario A
+  and `ci/audit_check.py`'s call-count assertions (updated: 6→7 tools,
+  11→15 total calls, 2→3 flagged read_file escapes).
+- New `ci/bench.py`: times 200 real `echo` round-trips through the
+  compiled binary + real wasm guest (every call pays for a fresh `Store`,
+  WASI context, and instantiation) and, as a rough floor, the same 200
+  calls against the unsandboxed Python mock — labeled honestly as not a
+  rigorous native baseline. Wired as the last step of `ci/smoke.sh`, so it
+  runs against the real binary on every CI push.
+- README: containment table now cites these two adversarial tests
+  directly instead of asserting the guarantees in prose alone; new
+  "Benchmark" subsection under Building and testing.
+
+Verified locally: the new mock-based harness self-test
+(`python3 ci/smoke_driver.py ... python3 ci/mock_toolcage.py ...` +
+`ci/audit_check.py`) passes 45+64 checks, confirming the new checks and
+count updates are well-formed before they ever touch real wasmtime.
+`cargo test --workspace` (67 tests, unaffected — these changes are in the
+fixture/CI-script layer, not the sandbox crate itself) and
+`cargo clippy --workspace --all-targets -- -D warnings` both clean. The
+real end-to-end run against actual wasmtime + a real compiled
+`wasm32-wasip1` guest — the only way to get real proof of these
+containment properties and real benchmark numbers — needs the
+`wasm32-wasip1` Rust target, which this local machine doesn't have (no
+rustup, only Homebrew's rustc); that leg runs for real in CI's `smoke`
+job, same limitation already documented for this repo's prior sessions.
+
 ## 0.1.0 - 2026-07-18
 
 Initial release.

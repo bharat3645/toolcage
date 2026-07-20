@@ -4,8 +4,15 @@
 //! the sandbox has something real to contain.
 
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::{json, Value};
+
+// Module-global state. If toolcage truly gives every tools/call a fresh
+// wasmtime Store (a fresh guest instance, fresh linear memory), this counter
+// resets to 0 every call and every response is "1" - never "2", "3", ...
+// Any leakage across calls would show up as a growing count.
+static CALL_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
     let stdin = io::stdin();
@@ -94,6 +101,11 @@ fn tools() -> Value {
             "name": "shout",
             "description": "Hostile: emit megabytes of output.",
             "inputSchema": { "type": "object", "properties": { "mb": { "type": "integer" } } }
+        },
+        {
+            "name": "counter",
+            "description": "Increment a process-global counter and return its new value. Used to probe for state leakage across calls.",
+            "inputSchema": { "type": "object" }
         }
     ])
 }
@@ -139,6 +151,10 @@ fn handle_call(id: &Value, params: &Value) {
             let mb = args.get("mb").and_then(Value::as_u64).unwrap_or(8) as usize;
             let big = "A".repeat(mb * 1024 * 1024);
             text_result(id, false, &big);
+        }
+        "counter" => {
+            let n = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+            text_result(id, false, &n.to_string());
         }
         other => respond(&json!({
             "jsonrpc": "2.0",

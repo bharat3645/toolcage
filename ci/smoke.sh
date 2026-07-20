@@ -33,7 +33,7 @@ python3 - "$WORK/inspect.json" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
 names = sorted(t["name"] for t in doc["tools"])
-assert names == ["echo", "env", "read_file", "shout", "spin", "write_file"], names
+assert names == ["counter", "echo", "env", "read_file", "shout", "spin", "write_file"], names
 assert doc["serverInfo"]["name"] == "toy-server", doc["serverInfo"]
 assert doc["truncated"] is False
 print("inspect OK")
@@ -44,5 +44,8 @@ python3 ci/smoke_driver.py "$WORK" "$BIN" "$WASM"
 
 echo "--- audit assertions"
 python3 ci/audit_check.py "$WORK"
+
+echo "--- per-call sandboxing overhead benchmark"
+python3 ci/bench.py "$WORK" "$BIN" "$WASM" 200
 
 echo "SMOKE OK"

@@ -17,7 +17,7 @@ import os
 import sys
 import time
 
-ALL_TOOLS = ["echo", "read_file", "write_file", "env", "spin", "shout"]
+ALL_TOOLS = ["echo", "read_file", "write_file", "env", "spin", "shout", "counter"]
 
 
 def now_rfc3339():
@@ -252,6 +252,12 @@ def main():
                 error(mid, -32005, "tool call exceeded its output budget",
                       {"class": "output_overflow", "detail": "mock"})
                 continue
+            elif name == "counter":
+                # Real toolcage gives every call a fresh Store, so the
+                # guest's global counter resets each time. The mock process
+                # itself doesn't restart per call, so it just always answers
+                # "1" - the value the fresh-instance guarantee predicts.
+                r = text_result(mid, False, "1")
             result_b = json.dumps(r["result"], separators=(",", ":")).encode()
             finish_call(name, args_b, "ok", is_error=r["result"]["isError"], result_b=result_b)
             reply(r)

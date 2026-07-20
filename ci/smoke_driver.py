@@ -131,7 +131,7 @@ def is_error_of(call_resp):
     return bool(call_resp.get("result", {}).get("isError"))
 
 
-ALL_TOOLS = ["echo", "env", "read_file", "shout", "spin", "write_file"]
+ALL_TOOLS = ["counter", "echo", "env", "read_file", "shout", "spin", "write_file"]
 
 
 def run_a(work, base_cmd, wasm):
@@ -151,7 +151,7 @@ def run_a(work, base_cmd, wasm):
     c.handshake()
 
     resp = c.request("tools/list")
-    ok(tool_names(resp) == ALL_TOOLS, "tools/list shows all 6 listed tools")
+    ok(tool_names(resp) == ALL_TOOLS, "tools/list shows all %d listed tools" % len(ALL_TOOLS))
 
     resp = c.call_tool("echo", {"text": CANARY_ARG})
     ok(text_of(resp) == "echo: " + CANARY_ARG, "echo round-trips")
@@ -167,6 +167,22 @@ def run_a(work, base_cmd, wasm):
     resp = c.call_tool("read_file", {"path": "/secret.txt"})
     ok(is_error_of(resp), "path outside any mount fails")
     ok("TOP-SECRET" not in json.dumps(resp), "unmounted path never sees host secret")
+
+    # Symlink escape: escape-link lives INSIDE the ro mount (make_workdir.sh)
+    # but points at the host secret OUTSIDE it - a different vector than the
+    # dot-dot check above, since the raw guest path string never leaves the
+    # mount; only symlink resolution does.
+    resp = c.call_tool("read_file", {"path": "/data/escape-link"})
+    ok(is_error_of(resp), "symlink escape from the mount fails")
+    ok("TOP-SECRET" not in json.dumps(resp), "symlink escape never sees host secret")
+
+    # State leakage across calls: if every tools/call truly gets a fresh
+    # guest instance, this process-global counter resets every time and
+    # every response is "1". A "2" here would mean state survived across
+    # calls - a real containment failure, not just an unverified claim.
+    for i in range(3):
+        resp = c.call_tool("counter", {})
+        ok(text_of(resp) == "1", "counter call %d returns 1, not accumulated state" % (i + 1))
 
     resp = c.call_tool("write_file", {"path": "/out/report.txt", "text": CANARY_OUT})
     ok(not is_error_of(resp), "write into rw mount succeeds")

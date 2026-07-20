@@ -36,14 +36,14 @@ client (Claude, etc.)
 
 | Threat | Mechanism |
 |---|---|
-| File exfiltration / tampering | WASI preopens: a tool sees only its policy's mounts, `ro` or `rw`. No policy entry = no filesystem at all. `..` escapes stop at the preopen root (capability model, not path filtering). |
+| File exfiltration / tampering | WASI preopens: a tool sees only its policy's mounts, `ro` or `rw`. No policy entry = no filesystem at all. `..` escapes stop at the preopen root (capability model, not path filtering) - and so do symlinks planted *inside* a mount that point outside it, a distinct vector from a literal `..` in the request path (both adversarially tested against a real guest, see Building and testing below). |
 | Network exfiltration | No socket API is linked into the runtime. There is nothing to firewall because the guest has no network, period. |
 | Env/credential leakage | Guest env contains exactly the policy's variables. Nothing is inherited from the host. |
 | CPU burn (infinite loops) | wasmtime fuel metering (`fuel` budget) - deterministic instruction budget. |
 | Wall-clock hangs | Epoch deadline (100ms ticks) plus a worker-thread join timeout as the outer net. |
 | Memory balloons | Store limits (`memory_max_mb`). |
 | Output floods | Bounded stdout pipe (`output_max_kb`); oversized output fails the call, never OOMs the host. |
-| State accumulation / cross-call contamination | Every call is a fresh instance. A rug-pulled tool cannot poison the next call's runtime state. |
+| State accumulation / cross-call contamination | Every call is a fresh instance. A rug-pulled tool cannot poison the next call's runtime state (adversarially tested: a guest tool incrementing a global counter gets a fresh zero every call, never accumulates - see Building and testing below). |
 | Denied/unlisted tools | Blocked before any guest code runs, and hidden from `tools/list`. |
 
 ## Quickstart
@@ -206,12 +206,38 @@ cargo test                      # 67 unit/integration tests, no wasm needed
 bash ci/smoke.sh                # full e2e: builds a real wasm guest
                                 # (needs the wasm32-wasip1 target) and runs
                                 # hostile-tool scenarios + audit assertions
+                                # + the per-call overhead benchmark below
 ```
 
 The smoke harness itself is validated: `ci/mock_toolcage.py` is a Python
 stand-in reproducing the client-visible semantics, so the driver and audit
 checker can be exercised without a Rust toolchain
 (`python3 ci/smoke_driver.py WORK python3 ci/mock_toolcage.py x.wasm`).
+
+The hostile guest (`fixtures/toy-server`) includes tools built specifically
+to adversarially probe the containment table above against a *real* guest,
+not just assert it: `counter` (a process-global that only ever answers "1"
+if instances are truly fresh) and a symlink planted inside the read-only
+mount, pointing at the host secret file just outside it
+(`ci/make_workdir.sh`'s `escape-link`) - a different escape vector than the
+literal `..` path already covered.
+
+### Benchmark: per-call sandboxing overhead
+
+`ci/bench.py` times 200 real `echo` round-trips through the compiled
+binary + real wasm guest (every call pays for a fresh `Store`, WASI
+context, and instantiation - see "How a call runs" above) and, as a rough
+floor, the same 200 calls against the unsandboxed Python mock:
+
+```sh
+python3 ci/bench.py WORK ./target/release/toolcage x.wasm 200
+```
+
+Run in CI on every push (`ci/smoke.sh`'s last step) against GitHub Actions'
+`ubuntu-latest` - see the latest [smoke run logs](https://github.com/bharat3645/toolcage/actions)
+for current numbers; the mock comparison is a floor for "protocol overhead
+alone," not a rigorous native baseline (different language, different
+process model), and is labeled as such in the benchmark's own output.
 
 ## License
 

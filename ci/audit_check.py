@@ -64,7 +64,7 @@ def check_a(work):
 
     probes = [e for e in events if e["event"] == "probe"]
     ok(len(probes) == 1, "exactly one probe")
-    ok(probes[0].get("tool_count") == 6, "probe saw 6 tools")
+    ok(probes[0].get("tool_count") == 7, "probe saw 7 tools")
     ok(probes[0].get("truncated") is False, "probe not truncated")
 
     echo_calls = calls_for(events, "echo")
@@ -79,10 +79,17 @@ def check_a(work):
     ok(e.get("exit_code") == 0, "echo guest exited 0")
 
     reads = calls_for(events, "read_file")
-    ok(len(reads) == 3, "three read_file calls audited")
+    ok(len(reads) == 4, "four read_file calls audited")
     ok(all(r.get("decision") == "allow" for r in reads), "read_file decisions allow")
     escapes = [r for r in reads if r.get("is_error")]
-    ok(len(escapes) == 2, "two read_file attempts flagged is_error (escape + unmounted)")
+    ok(
+        len(escapes) == 3,
+        "three read_file attempts flagged is_error (dot-dot escape, symlink escape, unmounted)",
+    )
+
+    counters = calls_for(events, "counter")
+    ok(len(counters) == 3, "three counter calls audited")
+    ok(all(c.get("decision") == "allow" and c.get("outcome") == "ok" for c in counters), "counter decisions/outcomes ok")
 
     writes = calls_for(events, "write_file")
     ok(len(writes) == 2, "two write_file calls audited")
@@ -108,7 +115,7 @@ def check_a(work):
 
     ends = [e for e in events if e["event"] == "session_end"]
     ok(len(ends) == 1, "exactly one session_end")
-    ok(ends[0].get("calls") == 11, "session_end counts 11 tools/call requests (got %s)" % ends[0].get("calls"))
+    ok(ends[0].get("calls") == 15, "session_end counts 15 tools/call requests (got %s)" % ends[0].get("calls"))
 
     for canary in (
         "CANARY_ARG_77f2",
