@@ -234,10 +234,24 @@ python3 ci/bench.py WORK ./target/release/toolcage x.wasm 200
 ```
 
 Run in CI on every push (`ci/smoke.sh`'s last step) against GitHub Actions'
-`ubuntu-latest` - see the latest [smoke run logs](https://github.com/bharat3645/toolcage/actions)
-for current numbers; the mock comparison is a floor for "protocol overhead
+`ubuntu-latest`; the mock comparison is a floor for "protocol overhead
 alone," not a rigorous native baseline (different language, different
 process model), and is labeled as such in the benchmark's own output.
+
+Real numbers, captured 2026-07-20 ([run](https://github.com/bharat3645/toolcage/actions/runs/29764204799),
+`ubuntu-latest`, 200 `echo` calls each):
+
+| | mean | median | p95 | p99 | min | max |
+|---|---|---|---|---|---|---|
+| real toolcage (wasmtime) | 0.423ms | 0.415ms | 0.509ms | 0.584ms | 0.384ms | 0.594ms |
+| mock (no sandbox, Python) | 0.094ms | 0.089ms | 0.116ms | 0.159ms | 0.084ms | 0.162ms |
+
+The fresh-`Store`-per-call guarantee costs roughly **+0.33ms median** over
+the unsandboxed floor - sub-millisecond, and dwarfed in practice by the
+guest MCP server's own work (a real `read_file`/`write_file`/tool call
+does actual I/O; `echo` is close to the cheapest possible call, chosen
+specifically to isolate sandboxing overhead from guest work). See future
+runs' logs for current numbers as the implementation evolves.
 
 ## License
 

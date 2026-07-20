@@ -26,19 +26,27 @@ containment claims, plus the first real per-call overhead numbers.
   directly instead of asserting the guarantees in prose alone; new
   "Benchmark" subsection under Building and testing.
 
-Verified locally: the new mock-based harness self-test
+Verified locally first: the mock-based harness self-test
 (`python3 ci/smoke_driver.py ... python3 ci/mock_toolcage.py ...` +
-`ci/audit_check.py`) passes 45+64 checks, confirming the new checks and
-count updates are well-formed before they ever touch real wasmtime.
+`ci/audit_check.py`) passed 45+64 checks, confirming the new checks and
+count updates were well-formed before they ever touched real wasmtime.
 `cargo test --workspace` (67 tests, unaffected — these changes are in the
 fixture/CI-script layer, not the sandbox crate itself) and
-`cargo clippy --workspace --all-targets -- -D warnings` both clean. The
-real end-to-end run against actual wasmtime + a real compiled
-`wasm32-wasip1` guest — the only way to get real proof of these
-containment properties and real benchmark numbers — needs the
-`wasm32-wasip1` Rust target, which this local machine doesn't have (no
-rustup, only Homebrew's rustc); that leg runs for real in CI's `smoke`
-job, same limitation already documented for this repo's prior sessions.
+`cargo clippy --workspace --all-targets -- -D warnings` both clean
+locally (no `wasm32-wasip1` target on this machine — no rustup, only
+Homebrew's rustc — so the real e2e leg needed CI either way).
+
+**Real end-to-end run, CI**: [run #29764204799](https://github.com/bharat3645/toolcage/actions/runs/29764204799),
+real compiled binary + real `wasm32-wasip1` guest, `ubuntu-latest`. Caught
+one real bug on the first push — `counter` was added to the guest and to
+every *expected*-tools list, but never actually granted in
+`ci/make_workdir.sh`'s `policy-a.yaml`, so the real (policy-filtered)
+`tools/list` correctly hid it under `unlisted_tools: deny` while the mock
+(which doesn't parse policy YAML) missed the gap entirely — fixed in a
+follow-up push. Second run: `DRIVER OK (45 checks)`, `AUDIT OK (64
+checks)`, both new adversarial checks (symlink escape, 3x counter
+statelessness) passing against the real sandbox. Real benchmark numbers
+now in the README's Benchmark section.
 
 ## 0.1.0 - 2026-07-18
 
