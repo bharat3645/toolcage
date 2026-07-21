@@ -123,11 +123,37 @@ Guest-produced JSON-RPC errors (e.g. the tool rejecting its arguments) pass
 through under the client's id. Guest results pass through verbatim,
 including `isError`.
 
+## Paginating `tools/list`
+
+By default toolcage returns every visible tool in one `tools/list` response —
+unchanged from before pagination existed. Pass `--page-size <n>` to `run` to
+cap each page at `n` tools; when more remain, the response carries an opaque
+`nextCursor` that the client sends back (per MCP) to fetch the next page:
+
+```bash
+toolcage run --module server.wasm --policy policy.yaml --page-size 50
+```
+
+Policy filtering happens **before** paging, so a denied or unlisted tool is
+absent from every page and reachable by no cursor value — the same guarantee
+the unpaginated list already gave.
+
+Cursors are opaque, stateless, and authenticated — the same discipline as the
+sandbox itself. toolcage keeps **no** server-side pagination state: the page
+position travels inside the cursor, HMAC-SHA256-signed with a key generated
+fresh for each `run` process and bound to a fingerprint of the exact visible
+tool set. A cursor that is edited, truncated, replayed against a different
+tool set, or reused after a restart fails verification and is rejected with
+`-32602` (`data.reason` is `malformed`, `bad_mac`, `snapshot_mismatch`, or
+`out_of_range`) — it is never silently mis-paginated. `--page-size 0` (the
+default) disables pagination entirely, so upgrading changes nothing.
+
 ## Audit trail
 
 JSONL, one event per line, file created `0600`. Events: `session_start`
-(module + policy sha256), `probe` (tool inventory), `client_initialize`,
-`call`, `session_end`.
+(module + policy sha256 + `page_size`), `probe` (tool inventory),
+`client_initialize`, `tools_list` (page metadata and rejected-cursor
+attempts, counts only), `call`, `session_end`.
 
 **Privacy invariant:** tool arguments, results, env values, and file
 contents are never written to the audit log - only names, byte counts,
@@ -171,9 +197,13 @@ Example `call` event:
   responses hits its budget and the call fails closed.
 - **Stateless guests only.** State resets on every call - that is the
   security feature, but it rules out servers that need cross-call memory.
-- **`tools/list` pagination is not followed.** Only the first page is
-  served; if the guest paginates, `inspect` and the audit `probe` event say
-  so honestly (`truncated: true`).
+- **The guest's own `tools/list` pagination is not followed during probe.**
+  toolcage paginates *its own* client-facing listing (`--page-size`, see
+  [Paginating `tools/list`](#paginating-toolslist)), but when it probes the
+  wrapped server it reads only the first page; if the guest paginates,
+  `inspect` and the audit `probe` event say so honestly (`truncated: true`).
+  Following the guest across pages needs an interactive probe — a change to
+  the one-shot execution model — and is future work.
 - **A guest blocked inside a host call** (e.g. a long `poll_oneoff` sleep)
   is not interruptible by fuel or epochs; the join timeout answers the
   client promptly but the worker thread is abandoned until process exit.
@@ -202,7 +232,7 @@ actually do* (capabilities, budgets). Use any alone; they compose.
 
 ```sh
 cargo build --release
-cargo test                      # 67 unit/integration tests, no wasm needed
+cargo test                      # 96 unit/integration tests, no wasm needed
 bash ci/smoke.sh                # full e2e: builds a real wasm guest
                                 # (needs the wasm32-wasip1 target) and runs
                                 # hostile-tool scenarios + audit assertions

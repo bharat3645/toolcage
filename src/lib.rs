@@ -7,6 +7,7 @@
 //! budgets that tool's policy grants. Network does not exist for the guest.
 
 pub mod audit;
+pub mod paginate;
 pub mod policy;
 pub mod rpc;
 pub mod runner;

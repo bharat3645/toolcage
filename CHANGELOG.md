@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### `tools/list` pagination
+
+Opt-in cursor pagination for the client-facing `tools/list`, designed to
+add nothing to the guest's attack surface and to weaken no existing
+guarantee.
+
+- New `--page-size <n>` flag on `run` (default `0` = disabled, so upgrading
+  changes nothing). With `n > 0`, `tools/list` returns at most `n` tools and,
+  when more remain, an opaque `nextCursor`; passing it back fetches the next
+  page. Denied/unlisted tools are filtered out *before* paging, so — exactly
+  as before — they are unreachable from every page and every cursor value.
+- Cursors are **stateless and tamper-evident**, mirroring the sandbox's
+  stateless-per-call model: the whole page position lives inside the cursor
+  (no server-side cursor registry), and each cursor is HMAC-SHA256-signed
+  with a per-process ephemeral key and bound to a snapshot id of the exact
+  ordered visible tool set. Any edit, truncation, cross-session reuse, or
+  post-restart cursor fails verification and is rejected with `-32602`, never
+  silently mis-paginated. Built on the crate's existing pure SHA-256 — no new
+  dependency. Constant-time tag comparison; strict base64url decoder that
+  rejects non-canonical input.
+- New `src/paginate.rs` (`Paginator`, cursor codec, HMAC, base64url) with 15
+  unit tests (HMAC pinned to RFC 4231, base64url roundtrip/rejection, snapshot
+  binding, and every rejection class). New `tests/pagination_test.rs`: 14
+  end-to-end tests through the real `Session` loop covering the empty list,
+  single page, exact page boundaries, a full multi-page walk, "denied tools
+  never appear on any page", non-string/malformed/tampered/expired cursors,
+  and backward-compatible disabled mode. A new `tools_list` audit event
+  records page metadata (counts only — no tool contents) and invalid-cursor
+  attempts.
+- Smoke harness extended: `ci/smoke_driver.py` scenarios D/D' walk real
+  cursors against the real binary + real wasm guest (7 tools at page size 3 →
+  3+3+1, tampered/malformed cursor rejection, single-page-no-cursor), with
+  `ci/mock_toolcage.py` taught the same pagination contract so the harness
+  self-check still validates the driver without wasm.
+- **Scope note (honest):** this is *egress* pagination — toolcage paginating
+  its own view. Following a *guest's* own `tools/list` pagination during the
+  probe (the `truncated` flag) still reads only the first page; that needs an
+  interactive/streaming probe, a change to the one-shot execution model,
+  and remains future work, surfaced honestly as before.
+
+### Adversarial-test + benchmark sprint
+
 Production-polish sprint: closes two real adversarial-test gaps in the
 containment claims, plus the first real per-call overhead numbers.
 

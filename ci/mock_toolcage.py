@@ -11,13 +11,58 @@ generates (policy-a.yaml / policy-b.yaml / none), not by parsing YAML.
 Usage mirrors toolcage: mock_toolcage.py run --module X [--policy P] [--audit A]
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import os
 import sys
 import time
 
 ALL_TOOLS = ["echo", "read_file", "write_file", "env", "spin", "shout", "counter"]
+
+# Per-process cursor key, mirroring toolcage's ephemeral-key design: cursors do
+# not survive a restart and cannot be forged. (This mock only needs the same
+# client-visible contract, not byte-identical cursors — the driver is opaque.)
+PAGE_KEY = os.urandom(32)
+
+
+def _snapshot_id(names):
+    h = hashlib.sha256()
+    h.update(len(names).to_bytes(8, "little"))
+    for n in names:
+        h.update(len(n).to_bytes(8, "little"))
+        h.update(n.encode())
+    return h.digest()[:8]
+
+
+def _encode_cursor(offset, snap):
+    body = offset.to_bytes(4, "big") + snap
+    tag = hmac.new(PAGE_KEY, body, hashlib.sha256).digest()[:16]
+    return "tc1." + base64.urlsafe_b64encode(body + tag).decode().rstrip("=")
+
+
+def _decode_cursor(cursor, snap, total, page_size):
+    """Return the offset, or None if the cursor is invalid/tampered/expired."""
+    if not isinstance(cursor, str) or not cursor.startswith("tc1."):
+        return None
+    b = cursor[4:]
+    try:
+        raw = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4))
+    except (ValueError, TypeError):
+        return None
+    if len(raw) != 28:
+        return None
+    body, tag = raw[:12], raw[12:]
+    expect = hmac.new(PAGE_KEY, body, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(expect, tag):
+        return None
+    if body[4:12] != snap:
+        return None
+    offset = int.from_bytes(body[:4], "big")
+    if offset == 0 or offset >= total or offset % page_size != 0:
+        return None
+    return offset
 
 
 def now_rfc3339():
@@ -53,13 +98,15 @@ def sha256_bytes(b):
 
 
 def parse_args(argv):
-    opts = {"module": None, "policy": None, "audit": None}
+    opts = {"module": None, "policy": None, "audit": None, "page_size": 0}
     it = iter(argv)
     for a in it:
         if a == "run":
             continue
         if a in ("--module", "--policy", "--audit"):
             opts[a[2:]] = next(it)
+        elif a == "--page-size":
+            opts["page_size"] = int(next(it))
     return opts
 
 
@@ -71,6 +118,7 @@ def main():
         scenario = "a" if "policy-a" in base else "b"
     work = os.path.dirname(os.path.abspath(opts["policy"])) if opts["policy"] else None
     audit = Audit(opts["audit"])
+    page_size = opts["page_size"]
 
     listed = {"a": ALL_TOOLS, "b": ["echo"], "c": ALL_TOOLS}[scenario]
     mounts = {}
@@ -184,12 +232,34 @@ def main():
         elif not initialized:
             error(mid, -32002, "server not initialized")
         elif method == "tools/list":
-            tools = [
-                {"name": n, "description": n, "inputSchema": {"type": "object"}}
-                for n in ALL_TOOLS
-                if n in listed
-            ]
-            reply({"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}})
+            visible = [n for n in ALL_TOOLS if n in listed]
+
+            def tool_obj(n):
+                return {"name": n, "description": n, "inputSchema": {"type": "object"}}
+
+            if page_size == 0:
+                # Pagination disabled: one page, cursor ignored (back-compat).
+                result = {"tools": [tool_obj(n) for n in visible]}
+            else:
+                snap = _snapshot_id(visible)
+                total = len(visible)
+                cursor = params.get("cursor")
+                if cursor is None:
+                    start = 0
+                elif not isinstance(cursor, str):
+                    error(mid, -32602, "tools/list cursor must be a string")
+                    continue
+                else:
+                    off = _decode_cursor(cursor, snap, total, page_size)
+                    if off is None:
+                        error(mid, -32602, "invalid or expired tools/list cursor")
+                        continue
+                    start = off
+                end = min(start + page_size, total)
+                result = {"tools": [tool_obj(n) for n in visible[start:end]]}
+                if end < total:
+                    result["nextCursor"] = _encode_cursor(end, snap)
+            reply({"jsonrpc": "2.0", "id": mid, "result": result})
         elif method == "tools/call":
             calls += 1
             name = params.get("name", "")

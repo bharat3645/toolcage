@@ -295,6 +295,98 @@ def run_c(work, base_cmd, wasm):
     ok(rc == 0, "clean exit on EOF (rc=%s)" % rc)
 
 
+def run_d(work, base_cmd, wasm):
+    print("scenario D: tools/list pagination (real cursors, page size 3)")
+    # Page size 3 over policy-a's 7 visible tools: expect 3 + 3 + 1.
+    c = Client(
+        base_cmd
+        + [
+            "run",
+            "--module",
+            wasm,
+            "--policy",
+            os.path.join(work, "policy-a.yaml"),
+            "--page-size",
+            "3",
+        ]
+    )
+    c.handshake()
+
+    seen = []
+    pages = 0
+    cursor = None
+    first_cursor = None
+    while True:
+        params = {"cursor": cursor} if cursor is not None else None
+        resp = c.request("tools/list", params)
+        ok("error" not in resp, "page %d is a result, not an error" % (pages + 1))
+        result = resp["result"]
+        names = [t["name"] for t in result["tools"]]
+        ok(len(names) <= 3, "page %d holds at most page_size (3) tools" % (pages + 1))
+        seen.extend(names)
+        pages += 1
+        nxt = result.get("nextCursor")
+        if pages == 1:
+            first_cursor = nxt
+        if nxt is None:
+            break
+        cursor = nxt
+        ok(pages < 10, "pagination terminates")
+    ok(pages == 3, "7 tools at page size 3 = 3 pages (got %d)" % pages)
+    ok(sorted(seen) == ALL_TOOLS, "pages together cover every tool")
+    ok(len(seen) == len(set(seen)), "no tool appears on more than one page")
+
+    # A tampered cursor is rejected with -32602. Flip an interior base64 char
+    # (index 4, just past the "tc1." prefix) so the edit changes real decoded
+    # bytes and trips the MAC in any conforming implementation — flipping the
+    # final char can be absorbed by non-canonical trailing bits.
+    ok(first_cursor is not None, "first page offered a nextCursor")
+    flipped = "A" if first_cursor[4] != "A" else "B"
+    tampered = first_cursor[:4] + flipped + first_cursor[5:]
+    resp = c.request("tools/list", {"cursor": tampered})
+    ok(
+        (resp.get("error") or {}).get("code") == -32602,
+        "tampered cursor rejected with -32602",
+    )
+
+    # A structurally-garbage cursor is likewise rejected.
+    resp = c.request("tools/list", {"cursor": "not-a-real-cursor"})
+    ok(
+        (resp.get("error") or {}).get("code") == -32602,
+        "malformed cursor rejected with -32602",
+    )
+
+    rc = c.close_and_wait()
+    ok(rc == 0, "clean exit on EOF (rc=%s)" % rc)
+
+
+def run_d_single_page(work, base_cmd, wasm):
+    print("scenario D': single visible tool, page size 3 -> one page, no cursor")
+    # policy-b exposes only `echo`; a page size larger than the visible set
+    # must return everything in one page with no nextCursor.
+    c = Client(
+        base_cmd
+        + [
+            "run",
+            "--module",
+            wasm,
+            "--policy",
+            os.path.join(work, "policy-b.yaml"),
+            "--page-size",
+            "3",
+        ]
+    )
+    c.handshake()
+    resp = c.request("tools/list")
+    ok(tool_names(resp) == ["echo"], "single visible tool listed")
+    ok(
+        "nextCursor" not in resp["result"],
+        "no cursor when the whole list fits in one page",
+    )
+    rc = c.close_and_wait()
+    ok(rc == 0, "clean exit on EOF (rc=%s)" % rc)
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -305,6 +397,8 @@ def main():
     run_a(work, base_cmd, wasm)
     run_b(work, base_cmd, wasm)
     run_c(work, base_cmd, wasm)
+    run_d(work, base_cmd, wasm)
+    run_d_single_page(work, base_cmd, wasm)
     print("DRIVER OK (%d checks)" % CHECKS["passed"])
     return 0
 

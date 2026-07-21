@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use toolcage::audit::{fields, sha256_hex, Auditor};
+use toolcage::audit::{fields, now_unix_ms, sha256, sha256_hex, Auditor};
 use toolcage::policy::{Decision, Grant, Policy};
 use toolcage::rpc;
 use toolcage::runner::Runner as _;
@@ -17,13 +17,17 @@ toolcage - per-tool-call WASM sandbox for MCP servers
 
 USAGE:
   toolcage run --module <server.wasm> [--policy <policy.yaml>]
-               [--audit <audit.jsonl>] [--debug-guest-stderr]
+               [--audit <audit.jsonl>] [--page-size <n>]
+               [--debug-guest-stderr]
       Serve MCP over stdio; every tools/call runs in a fresh wasmtime
       instance with only that tool's granted capabilities.
       Without --policy: all tools run, but with no filesystem and no env
       (capability vacuum). With --policy: unlisted tools are denied unless
       the policy says otherwise.
       Without --audit: audit JSONL goes to stderr.
+      --page-size <n>: paginate tools/list into pages of n tools, emitting an
+      opaque authenticated nextCursor. Default 0 = no pagination (one page).
+      Cursors are per-process: they do not survive a restart.
 
   toolcage inspect --module <server.wasm> [--json]
       Instantiate the module with zero capabilities and list its tools.
@@ -91,6 +95,7 @@ fn cmd_run(args: &[String]) -> i32 {
     let mut module: Option<PathBuf> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut audit_path: Option<PathBuf> = None;
+    let mut page_size: usize = 0;
     let mut debug_guest_stderr = false;
     let mut p = FlagParser::new(args);
     while let Some(a) = p.next() {
@@ -105,6 +110,15 @@ fn cmd_run(args: &[String]) -> i32 {
             },
             "--audit" => match p.value("--audit") {
                 Ok(v) => audit_path = Some(PathBuf::from(v)),
+                Err(e) => return usage_error(&e),
+            },
+            "--page-size" => match p.value("--page-size") {
+                Ok(v) => match v.parse::<usize>() {
+                    Ok(n) => page_size = n,
+                    Err(_) => {
+                        return usage_error("--page-size requires a non-negative integer")
+                    }
+                },
                 Err(e) => return usage_error(&e),
             },
             "--debug-guest-stderr" => debug_guest_stderr = true,
@@ -167,6 +181,7 @@ fn cmd_run(args: &[String]) -> i32 {
             "module_sha256": module_sha,
             "policy": policy_path.as_ref().map(|p| p.display().to_string()),
             "policy_sha256": policy_sha,
+            "page_size": page_size,
         })),
     );
     {
@@ -184,7 +199,12 @@ fn cmd_run(args: &[String]) -> i32 {
         );
     }
 
-    let mut session = Session::new(&runner, &policy, &audit);
+    let cursor_key = if page_size > 0 {
+        ephemeral_cursor_key(&module_sha)
+    } else {
+        [0u8; 32]
+    };
+    let mut session = Session::new_paginated(&runner, &policy, &audit, page_size, cursor_key);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -350,6 +370,33 @@ fn cmd_check(args: &[String]) -> i32 {
         println!("check OK");
         0
     }
+}
+
+/// Derive the per-process cursor-signing key.
+///
+/// This is not a long-term secret: it only needs to be unpredictable across
+/// processes and constant within one, so that pagination cursors cannot be
+/// forged and do not survive a restart. OS entropy is the primary source;
+/// process- and time-unique material is always folded in as a fallback so the
+/// key still differs across runs if `/dev/urandom` is unavailable.
+fn ephemeral_cursor_key(module_sha: &str) -> [u8; 32] {
+    let mut seed: Vec<u8> = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 32];
+            if f.read_exact(&mut buf).is_ok() {
+                seed.extend_from_slice(&buf);
+            }
+        }
+    }
+    seed.extend_from_slice(module_sha.as_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&now_unix_ms().to_le_bytes());
+    let marker = &seed as *const _ as usize as u64;
+    seed.extend_from_slice(&marker.to_le_bytes());
+    sha256(&seed)
 }
 
 fn usage_error(msg: &str) -> i32 {

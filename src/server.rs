@@ -6,12 +6,13 @@
 use std::io::Write;
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::audit::{fields, sha256_hex, Auditor};
+use crate::paginate::Paginator;
 use crate::policy::{Decision, Policy};
 use crate::rpc::{self, Incoming};
-use crate::runner::{CallOutcome, Runner};
+use crate::runner::{CallOutcome, Runner, ToolDef};
 
 pub struct Session<'a, R: Runner> {
     runner: &'a R,
@@ -20,10 +21,30 @@ pub struct Session<'a, R: Runner> {
     initialized: bool,
     calls: u64,
     started: Instant,
+    /// Tools per `tools/list` page; `0` disables pagination (one unlimited
+    /// page, no cursor ever emitted — the pre-pagination behavior).
+    page_size: usize,
+    /// Per-process ephemeral key that authenticates the cursors this session
+    /// mints. Zeroed when pagination is disabled (no cursor is ever signed).
+    cursor_key: [u8; 32],
 }
 
 impl<'a, R: Runner> Session<'a, R> {
+    /// A session with pagination disabled: `tools/list` returns every visible
+    /// tool in one page, exactly as before pagination existed.
     pub fn new(runner: &'a R, policy: &'a Policy, audit: &'a Auditor) -> Self {
+        Session::new_paginated(runner, policy, audit, 0, [0u8; 32])
+    }
+
+    /// A session that paginates `tools/list` into pages of `page_size` tools
+    /// (0 disables), minting cursors signed with `cursor_key`.
+    pub fn new_paginated(
+        runner: &'a R,
+        policy: &'a Policy,
+        audit: &'a Auditor,
+        page_size: usize,
+        cursor_key: [u8; 32],
+    ) -> Self {
         Session {
             runner,
             policy,
@@ -31,6 +52,8 @@ impl<'a, R: Runner> Session<'a, R> {
             initialized: false,
             calls: 0,
             started: Instant::now(),
+            page_size,
+            cursor_key,
         }
     }
 
@@ -97,7 +120,7 @@ impl<'a, R: Runner> Session<'a, R> {
                 if !self.initialized {
                     return self.not_initialized(id);
                 }
-                rpc::result_line(id, json!({ "tools": self.visible_tools() }))
+                self.handle_list(id, params)
             }
             "tools/call" => {
                 if !self.initialized {
@@ -123,14 +146,81 @@ impl<'a, R: Runner> Session<'a, R> {
         )
     }
 
-    fn visible_tools(&self) -> Vec<Value> {
+    /// The probed tools this policy lets the client see, in stable probe
+    /// order. Filtering happens here, before any paging, so a denied tool is
+    /// unreachable from every page and every cursor value.
+    fn visible_tool_defs(&self) -> Vec<&ToolDef> {
         self.runner
             .probe()
             .tools
             .iter()
             .filter(|t| self.policy.visible(&t.name))
-            .map(|t| t.raw.clone())
             .collect()
+    }
+
+    /// `tools/list`, optionally paginated. The full visible set is filtered
+    /// first; the requested page is then sliced from it and, if more tools
+    /// remain, an opaque authenticated `nextCursor` is attached.
+    fn handle_list(&self, id: &Value, params: &Value) -> String {
+        let cursor = match params.get("cursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                self.audit.log(
+                    "tools_list",
+                    fields(json!({ "outcome": "invalid_cursor", "reason": "not_a_string" })),
+                );
+                return rpc::error_line(
+                    id,
+                    rpc::CODE_INVALID_PARAMS,
+                    "tools/list cursor must be a string",
+                    None,
+                );
+            }
+        };
+
+        let visible = self.visible_tool_defs();
+        let names: Vec<&str> = visible.iter().map(|t| t.name.as_str()).collect();
+        let paginator = Paginator::new(self.cursor_key, &names, self.page_size);
+
+        let page = match paginator.page(cursor) {
+            Ok(p) => p,
+            Err(e) => {
+                self.audit.log(
+                    "tools_list",
+                    fields(json!({ "outcome": "invalid_cursor", "reason": e.as_str() })),
+                );
+                return rpc::error_line(
+                    id,
+                    rpc::CODE_INVALID_PARAMS,
+                    "invalid or expired tools/list cursor",
+                    Some(json!({ "reason": e.as_str() })),
+                );
+            }
+        };
+
+        let tools: Vec<Value> = visible[page.start..page.end]
+            .iter()
+            .map(|t| t.raw.clone())
+            .collect();
+        let mut result = Map::new();
+        result.insert("tools".to_string(), Value::Array(tools));
+        if let Some(next) = &page.next_cursor {
+            result.insert("nextCursor".to_string(), json!(next));
+        }
+
+        self.audit.log(
+            "tools_list",
+            fields(json!({
+                "outcome": "ok",
+                "total_visible": paginator.total(),
+                "page_start": page.start,
+                "page_len": page.end - page.start,
+                "has_next": page.next_cursor.is_some(),
+                "paginated": self.page_size > 0,
+            })),
+        );
+        rpc::result_line(id, Value::Object(result))
     }
 
     fn handle_call(&mut self, id: &Value, params: &Value) -> String {
