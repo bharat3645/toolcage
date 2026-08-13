@@ -46,9 +46,78 @@ client (Claude, etc.)
 | State accumulation / cross-call contamination | Every call is a fresh instance. A rug-pulled tool cannot poison the next call's runtime state (adversarially tested: a guest tool incrementing a global counter gets a fresh zero every call, never accumulates - see Building and testing below). |
 | Denied/unlisted tools | Blocked before any guest code runs, and hidden from `tools/list`. |
 
+## Building and testing
+
+toolcage is not published to [crates.io](https://crates.io) yet — build it
+from source:
+
+```sh
+cargo build --release
+cargo test                      # 96 unit/integration tests, no wasm needed
+bash ci/smoke.sh                # full e2e: builds a real wasm guest
+                                # (needs the wasm32-wasip1 target) and runs
+                                # hostile-tool scenarios + audit assertions
+                                # + the per-call overhead benchmark below
+```
+
+This produces the `toolcage` binary at `./target/release/toolcage` — the
+[Quickstart](#quickstart) below invokes it as `toolcage`, so either put
+`target/release` on your `PATH` (e.g. `export
+PATH="$PWD/target/release:$PATH"`) or replace `toolcage` with
+`./target/release/toolcage` in each command.
+
+The smoke harness itself is validated: `ci/mock_toolcage.py` is a Python
+stand-in reproducing the client-visible semantics, so the driver and audit
+checker can be exercised without a Rust toolchain
+(`python3 ci/smoke_driver.py WORK python3 ci/mock_toolcage.py x.wasm`).
+
+The hostile guest (`fixtures/toy-server`) includes tools built specifically
+to adversarially probe the containment table above against a *real* guest,
+not just assert it: `counter` (a process-global that only ever answers "1"
+if instances are truly fresh) and a symlink planted inside the read-only
+mount, pointing at the host secret file just outside it
+(`ci/make_workdir.sh`'s `escape-link`) - a different escape vector than the
+literal `..` path already covered.
+
+### Benchmark: per-call sandboxing overhead
+
+`ci/bench.py` times 200 real `echo` round-trips through the compiled
+binary + real wasm guest (every call pays for a fresh `Store`, WASI
+context, and instantiation - see [How a call runs](#how-a-call-runs) below)
+and, as a rough floor, the same 200 calls against the unsandboxed Python
+mock:
+
+```sh
+python3 ci/bench.py WORK ./target/release/toolcage x.wasm 200
+```
+
+Run in CI on every push (`ci/smoke.sh`'s last step) against GitHub Actions'
+`ubuntu-latest`; the mock comparison is a floor for "protocol overhead
+alone," not a rigorous native baseline (different language, different
+process model), and is labeled as such in the benchmark's own output.
+
+Real numbers, captured 2026-07-20 ([run](https://github.com/bharat3645/toolcage/actions/runs/29764204799),
+`ubuntu-latest`, 200 `echo` calls each):
+
+| | mean | median | p95 | p99 | min | max |
+|---|---|---|---|---|---|---|
+| real toolcage (wasmtime) | 0.423ms | 0.415ms | 0.509ms | 0.584ms | 0.384ms | 0.594ms |
+| mock (no sandbox, Python) | 0.094ms | 0.089ms | 0.116ms | 0.159ms | 0.084ms | 0.162ms |
+
+The fresh-`Store`-per-call guarantee costs roughly **+0.33ms median** over
+the unsandboxed floor - sub-millisecond, and dwarfed in practice by the
+guest MCP server's own work (a real `read_file`/`write_file`/tool call
+does actual I/O; `echo` is close to the cheapest possible call, chosen
+specifically to isolate sandboxing overhead from guest work). See future
+runs' logs for current numbers as the implementation evolves.
+
 ## Quickstart
 
 ```sh
+# 0. Build it first (see Building and testing above) - these commands
+#    assume ./target/release is on your PATH; otherwise prefix each
+#    with ./target/release/
+
 # 1. What does this server expose? (zero capabilities granted)
 toolcage inspect --module server.wasm
 
@@ -227,61 +296,6 @@ toolcage is the containment layer of a set of small, composable tools:
 detection), [mcp-gateway-lite] governs *who may call what* at the HTTP layer
 (allowlists, rate limits, audit), and toolcage bounds *what a call can
 actually do* (capabilities, budgets). Use any alone; they compose.
-
-## Building and testing
-
-```sh
-cargo build --release
-cargo test                      # 96 unit/integration tests, no wasm needed
-bash ci/smoke.sh                # full e2e: builds a real wasm guest
-                                # (needs the wasm32-wasip1 target) and runs
-                                # hostile-tool scenarios + audit assertions
-                                # + the per-call overhead benchmark below
-```
-
-The smoke harness itself is validated: `ci/mock_toolcage.py` is a Python
-stand-in reproducing the client-visible semantics, so the driver and audit
-checker can be exercised without a Rust toolchain
-(`python3 ci/smoke_driver.py WORK python3 ci/mock_toolcage.py x.wasm`).
-
-The hostile guest (`fixtures/toy-server`) includes tools built specifically
-to adversarially probe the containment table above against a *real* guest,
-not just assert it: `counter` (a process-global that only ever answers "1"
-if instances are truly fresh) and a symlink planted inside the read-only
-mount, pointing at the host secret file just outside it
-(`ci/make_workdir.sh`'s `escape-link`) - a different escape vector than the
-literal `..` path already covered.
-
-### Benchmark: per-call sandboxing overhead
-
-`ci/bench.py` times 200 real `echo` round-trips through the compiled
-binary + real wasm guest (every call pays for a fresh `Store`, WASI
-context, and instantiation - see "How a call runs" above) and, as a rough
-floor, the same 200 calls against the unsandboxed Python mock:
-
-```sh
-python3 ci/bench.py WORK ./target/release/toolcage x.wasm 200
-```
-
-Run in CI on every push (`ci/smoke.sh`'s last step) against GitHub Actions'
-`ubuntu-latest`; the mock comparison is a floor for "protocol overhead
-alone," not a rigorous native baseline (different language, different
-process model), and is labeled as such in the benchmark's own output.
-
-Real numbers, captured 2026-07-20 ([run](https://github.com/bharat3645/toolcage/actions/runs/29764204799),
-`ubuntu-latest`, 200 `echo` calls each):
-
-| | mean | median | p95 | p99 | min | max |
-|---|---|---|---|---|---|---|
-| real toolcage (wasmtime) | 0.423ms | 0.415ms | 0.509ms | 0.584ms | 0.384ms | 0.594ms |
-| mock (no sandbox, Python) | 0.094ms | 0.089ms | 0.116ms | 0.159ms | 0.084ms | 0.162ms |
-
-The fresh-`Store`-per-call guarantee costs roughly **+0.33ms median** over
-the unsandboxed floor - sub-millisecond, and dwarfed in practice by the
-guest MCP server's own work (a real `read_file`/`write_file`/tool call
-does actual I/O; `echo` is close to the cheapest possible call, chosen
-specifically to isolate sandboxing overhead from guest work). See future
-runs' logs for current numbers as the implementation evolves.
 
 ## License
 
