@@ -32,6 +32,25 @@ client (Claude, etc.)
 
 [wasmtime]: https://wasmtime.dev
 
+## Demo
+
+```sh
+asciinema play demo/toolcage-demo.cast
+```
+
+A real terminal recording against the compiled binary and the real
+`fixtures/toy-server` wasm guest: `inspect` shows the guest's full,
+capability-free tool list; a policy grants only `echo` and a read-only
+`/data` mount; `tools/list` comes back filtered to just those two tools;
+`read_file` succeeds on a path inside the mount; the same tool is denied
+(`Operation not permitted`, not "file not found") when asked to follow a
+symlink planted inside the mount that points at a host secret outside it —
+the WASI capability boundary holds even though the *path itself* never
+contains `..`; `write_file`, never listed in the policy, is rejected with
+`-32003` before the guest is ever instantiated; and the audit log's own
+content is checked against the secret string, confirming the privacy
+invariant holds — metadata only, never file contents.
+
 ## Containment layers
 
 | Threat | Mechanism |
