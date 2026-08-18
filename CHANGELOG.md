@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- `demo/toolcage-demo.cast` — a real asciinema recording of the containment
+  story: `inspect` shows the guest's full capability-free tool list, a
+  policy grants only `echo` + a read-only `/data` mount, `tools/list` comes
+  back filtered to just those two, a legitimate read succeeds, a symlink
+  planted inside the mount that points at a host secret outside it is
+  blocked by the WASI capability sandbox (not string-matched path
+  filtering), an unlisted tool is denied before the guest ever runs, and
+  the audit log is confirmed to carry hashes and outcomes only — never the
+  secret's contents. See the README's new Demo section.
+
 ### `tools/list` pagination
 
 Opt-in cursor pagination for the client-facing `tools/list`, designed to
