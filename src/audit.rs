@@ -1,9 +1,12 @@
-//! JSONL audit trail.
+//! JSONL audit trail with hash-chaining.
 //!
 //! Privacy invariant (same discipline as mcp-gateway-lite): tool call
 //! arguments, results, and env values are NEVER written to the audit log.
 //! Only names, byte counts, hashes, decisions, outcomes, and timings appear.
 //! Hashes give correlation power without content.
+//!
+//! Hash-chaining: each line includes `prev_event_hash` pointing to the SHA-256
+//! hex digest of the preceding raw audit JSON line (genesis line uses `""`).
 //!
 //! Sink failures never break a call: failed writes are counted and dropped.
 
@@ -25,6 +28,7 @@ enum Sink {
 
 pub struct Auditor {
     sink: Mutex<Sink>,
+    prev_hash: Mutex<String>,
     dropped: AtomicU64,
 }
 
@@ -43,6 +47,7 @@ impl Auditor {
             .with_context(|| format!("failed to open audit log {}", path.display()))?;
         Ok(Auditor {
             sink: Mutex::new(Sink::File(file)),
+            prev_hash: Mutex::new(String::new()),
             dropped: AtomicU64::new(0),
         })
     }
@@ -51,6 +56,7 @@ impl Auditor {
     pub fn to_stderr() -> Auditor {
         Auditor {
             sink: Mutex::new(Sink::Stderr),
+            prev_hash: Mutex::new(String::new()),
             dropped: AtomicU64::new(0),
         }
     }
@@ -59,24 +65,38 @@ impl Auditor {
     pub fn to_memory() -> Auditor {
         Auditor {
             sink: Mutex::new(Sink::Memory(Vec::new())),
+            prev_hash: Mutex::new(String::new()),
             dropped: AtomicU64::new(0),
         }
     }
 
-    /// Write one event line. `fields` must not contain "ts" or "event"
+    /// Write one event line. `fields` must not contain "ts", "event", or "prev_event_hash"
     /// (they are set here). Never panics; failures increment `dropped`.
     pub fn log(&self, event: &str, fields: Map<String, Value>) {
+        let mut prev_guard = match self.prev_hash.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         let mut obj = Map::new();
         obj.insert(
             "ts".to_string(),
             Value::String(rfc3339_utc(now_unix_ms())),
         );
         obj.insert("event".to_string(), Value::String(event.to_string()));
+        obj.insert(
+            "prev_event_hash".to_string(),
+            Value::String(prev_guard.clone()),
+        );
         for (k, v) in fields {
             obj.insert(k, v);
         }
         let mut line = Value::Object(obj).to_string();
         line.push('\n');
+
+        // Update the rolling SHA-256 digest of this line for the next event
+        *prev_guard = sha256_hex(line.as_bytes());
+
         let ok = match self.sink.lock() {
             Ok(mut sink) => match &mut *sink {
                 Sink::File(f) => f.write_all(line.as_bytes()).is_ok(),

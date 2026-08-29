@@ -78,25 +78,39 @@ fn rfc3339_century_boundary_and_millis() {
 }
 
 // ---------------------------------------------------------------------------
-// Auditor behavior
+// Auditor behavior & Hash Chaining
 // ---------------------------------------------------------------------------
 
 #[test]
-fn memory_sink_writes_jsonl_with_ts_and_event() {
+fn memory_sink_writes_jsonl_with_ts_event_and_hash_chain() {
     let a = Auditor::to_memory();
     a.log("session_start", fields(json!({ "k": 1 })));
     a.log("call", fields(json!({ "tool": "echo" })));
+    a.log("session_end", fields(json!({ "ok": true })));
+
     let text = a.memory_contents().expect("memory sink");
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 2);
-    for line in &lines {
-        let v: Value = serde_json::from_str(line).expect("each audit line is JSON");
-        assert!(v.get("ts").and_then(Value::as_str).is_some());
-        assert!(v.get("event").and_then(Value::as_str).is_some());
-    }
-    let first: Value = serde_json::from_str(lines[0]).unwrap();
+    let raw_lines: Vec<&str> = text.lines().collect();
+    assert_eq!(raw_lines.len(), 3);
+
+    let first: Value = serde_json::from_str(raw_lines[0]).unwrap();
     assert_eq!(first["event"], "session_start");
     assert_eq!(first["k"], 1);
+    assert_eq!(first["prev_event_hash"], "");
+
+    let first_line_raw = format!("{}\n", raw_lines[0]);
+    let first_line_hash = sha256_hex(first_line_raw.as_bytes());
+
+    let second: Value = serde_json::from_str(raw_lines[1]).unwrap();
+    assert_eq!(second["event"], "call");
+    assert_eq!(second["prev_event_hash"], first_line_hash);
+
+    let second_line_raw = format!("{}\n", raw_lines[1]);
+    let second_line_hash = sha256_hex(second_line_raw.as_bytes());
+
+    let third: Value = serde_json::from_str(raw_lines[2]).unwrap();
+    assert_eq!(third["event"], "session_end");
+    assert_eq!(third["prev_event_hash"], second_line_hash);
+
     assert_eq!(a.dropped(), 0);
 }
 
