@@ -1,11 +1,20 @@
-//! JSONL audit trail.
+//! JSONL audit trail with hash-chaining.
 //!
 //! Privacy invariant (same discipline as mcp-gateway-lite): tool call
 //! arguments, results, and env values are NEVER written to the audit log.
 //! Only names, byte counts, hashes, decisions, outcomes, and timings appear.
 //! Hashes give correlation power without content.
 //!
+//! Hash-chaining: each line includes `prev_event_hash` pointing to the SHA-256
+//! hex digest of the preceding raw audit JSON line (including its trailing
+//! newline). The first line of a fresh log uses `""`. Reopening an existing
+//! file resumes the chain from the last line already on disk, so a verifier
+//! can walk one file as a single chain across process restarts.
+//!
 //! Sink failures never break a call: failed writes are counted and dropped.
+//! Note that a dropped write still advances the in-memory chain, so a
+//! persisted file only verifies end-to-end when `dropped() == 0` — a consumer
+//! claiming "hash-chain intact" must check both.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -25,12 +34,19 @@ enum Sink {
 
 pub struct Auditor {
     sink: Mutex<Sink>,
+    prev_hash: Mutex<String>,
     dropped: AtomicU64,
 }
 
 impl Auditor {
     /// Append to a JSONL file, created 0600 on unix.
+    ///
+    /// If `path` already has content, the chain resumes from the last line
+    /// on disk instead of restarting at the `""` genesis hash, so restart
+    /// boundaries are covered by the chain rather than being a blind spot.
     pub fn to_file(path: &Path) -> Result<Auditor> {
+        let (seed, needs_terminator) = chain_seed(path)
+            .with_context(|| format!("failed to read existing audit log {}", path.display()))?;
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -38,11 +54,19 @@ impl Auditor {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts
+        let mut file = opts
             .open(path)
             .with_context(|| format!("failed to open audit log {}", path.display()))?;
+        if needs_terminator {
+            // The previous process died mid-line. Terminate the partial line
+            // so new events don't glue onto it; the seed already covers the
+            // partial bytes plus this newline.
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to repair audit log {}", path.display()))?;
+        }
         Ok(Auditor {
             sink: Mutex::new(Sink::File(file)),
+            prev_hash: Mutex::new(seed),
             dropped: AtomicU64::new(0),
         })
     }
@@ -51,6 +75,7 @@ impl Auditor {
     pub fn to_stderr() -> Auditor {
         Auditor {
             sink: Mutex::new(Sink::Stderr),
+            prev_hash: Mutex::new(String::new()),
             dropped: AtomicU64::new(0),
         }
     }
@@ -59,24 +84,38 @@ impl Auditor {
     pub fn to_memory() -> Auditor {
         Auditor {
             sink: Mutex::new(Sink::Memory(Vec::new())),
+            prev_hash: Mutex::new(String::new()),
             dropped: AtomicU64::new(0),
         }
     }
 
-    /// Write one event line. `fields` must not contain "ts" or "event"
+    /// Write one event line. `fields` must not contain "ts", "event", or "prev_event_hash"
     /// (they are set here). Never panics; failures increment `dropped`.
     pub fn log(&self, event: &str, fields: Map<String, Value>) {
+        let mut prev_guard = match self.prev_hash.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         let mut obj = Map::new();
         obj.insert(
             "ts".to_string(),
             Value::String(rfc3339_utc(now_unix_ms())),
         );
         obj.insert("event".to_string(), Value::String(event.to_string()));
+        obj.insert(
+            "prev_event_hash".to_string(),
+            Value::String(prev_guard.clone()),
+        );
         for (k, v) in fields {
             obj.insert(k, v);
         }
         let mut line = Value::Object(obj).to_string();
         line.push('\n');
+
+        // Update the rolling SHA-256 digest of this line for the next event
+        *prev_guard = sha256_hex(line.as_bytes());
+
         let ok = match self.sink.lock() {
             Ok(mut sink) => match &mut *sink {
                 Sink::File(f) => f.write_all(line.as_bytes()).is_ok(),
@@ -106,6 +145,61 @@ impl Auditor {
             },
             Err(_) => None,
         }
+    }
+}
+
+/// Seed for resuming the hash chain over an existing audit file: the SHA-256
+/// of the last line's exact bytes as they sit on disk, plus whether the file
+/// needs a terminating newline appended before new events are written.
+///
+/// Returns `("", false)` (genesis) for a missing or empty file. For a
+/// complete last line the hashed bytes include the trailing newline,
+/// matching what `log()` hashed when it wrote that line. For a truncated
+/// final line (e.g. a crash mid-write) the caller must append a `\n` before
+/// writing new events — otherwise they would glue onto the partial line —
+/// and the seed covers the partial bytes plus that repair newline, so a
+/// plain line-by-line verifier walk holds from the repair point onward. The
+/// truncated line itself still shows up as a chain break, which is the
+/// honest outcome: those bytes really were never fully persisted.
+///
+/// Only a bounded tail of the file is read (widening only if a single line
+/// exceeds the window), so opening a large long-lived log stays cheap.
+fn chain_seed(path: &Path) -> std::io::Result<(String, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), false)),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok((String::new(), false));
+    }
+    let mut window: u64 = 8 * 1024;
+    loop {
+        let start = len.saturating_sub(window);
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::with_capacity((len - start) as usize);
+        f.read_to_end(&mut buf)?;
+        let terminated = buf.last() == Some(&b'\n');
+        // Ignore the file's trailing newline when looking for the *previous*
+        // line boundary; the last line's own bytes run to end-of-file.
+        let scan_end = if terminated { buf.len() - 1 } else { buf.len() };
+        let line_start = match buf[..scan_end].iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None if start == 0 => 0,
+            None => {
+                // Window landed mid-line; widen and retry.
+                window *= 2;
+                continue;
+            }
+        };
+        let mut last_line = buf[line_start..].to_vec();
+        if !terminated {
+            // Hash includes the repair newline the caller will append.
+            last_line.push(b'\n');
+        }
+        return Ok((sha256_hex(&last_line), !terminated));
     }
 }
 
